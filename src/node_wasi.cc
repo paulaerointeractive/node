@@ -72,11 +72,20 @@ inline void Debug(WASI* wasi, Args&&... args) {
     }                                                                         \
   } while (0)
 
+#define CHECK_BOUNDS_OR_RETURN2(mem_size, offset, buf_size)                   \
+  do {                                                                        \
+    if (!uvwasi_serdes_check_bounds((offset), (mem_size), (buf_size))) {      \
+      return UVWASI_EOVERFLOW;                                                \
+    }                                                                         \
+  } while (0)
+
 using v8::Array;
 using v8::BackingStore;
 using v8::BigInt;
+using v8::CFunction;
 using v8::Context;
 using v8::Exception;
+using v8::FastApiCallbackOptions;
 using v8::FunctionCallbackInfo;
 using v8::FunctionTemplate;
 using v8::Integer;
@@ -84,6 +93,7 @@ using v8::Isolate;
 using v8::Local;
 using v8::MaybeLocal;
 using v8::Object;
+using v8::Signature;
 using v8::String;
 using v8::Uint32;
 using v8::Value;
@@ -248,45 +258,118 @@ void WASI::New(const FunctionCallbackInfo<Value>& args) {
   }
 }
 
+struct WasmMemory {
+  char* data;
+  size_t size;
+};
 
-void WASI::ArgsGet(const FunctionCallbackInfo<Value>& args) {
-  WASI* wasi;
-  uint32_t argv_offset;
-  uint32_t argv_buf_offset;
-  char* memory;
-  size_t mem_size;
-  RETURN_IF_BAD_ARG_COUNT(args, 2);
-  CHECK_TO_TYPE_OR_RETURN(args, args[0], Uint32, argv_offset);
-  CHECK_TO_TYPE_OR_RETURN(args, args[1], Uint32, argv_buf_offset);
-  ASSIGN_INITIALIZED_OR_RETURN_UNWRAP(&wasi, args.This());
-  Debug(wasi, "args_get(%d, %d)\n", argv_offset, argv_buf_offset);
-  GET_BACKING_STORE_OR_RETURN(wasi, args, &memory, &mem_size);
-  CHECK_BOUNDS_OR_RETURN(args,
-                         mem_size,
-                         argv_buf_offset,
-                         wasi->uvw_.argv_buf_size);
-  CHECK_BOUNDS_OR_RETURN(args,
-                         mem_size,
-                         argv_offset,
-                         wasi->uvw_.argc * UVWASI_SERDES_SIZE_uint32_t);
-  std::vector<char*> argv(wasi->uvw_.argc);
-  char* argv_buf = &memory[argv_buf_offset];
-  uvwasi_errno_t err = uvwasi_args_get(&wasi->uvw_, argv.data(), argv_buf);
+template <auto F, typename R, typename... Args>
+class WasiFunction {
+ public:
+  static void SetFunction(Environment* env, const char* name, Local<FunctionTemplate> tmpl) {
+    auto c_function = CFunction::Make(FastCallback);
+    // auto index_seq = std::make_index_sequence<sizeof...(Args)>();
+    Local<FunctionTemplate> t = v8::FunctionTemplate::New(
+      env->isolate(),
+      SlowCallback /*<typeof(index_seq)>*/,
+      Local<Value>(), Local<Signature>(), sizeof...(Args),
+      v8::ConstructorBehavior::kThrow,
+      v8::SideEffectType::kHasSideEffect, &c_function
+    );
+    const v8::NewStringType type = v8::NewStringType::kInternalized;
+    v8::Local<v8::String> name_string =
+        v8::String::NewFromUtf8(env->isolate(), name, type).ToLocalChecked();
+    tmpl->PrototypeTemplate()->Set(name_string, t);
+    t->SetClassName(name_string);  // NODE_SET_PROTOTYPE_METHOD() compatibility.
+  }
+
+ private:
+  static R FastCallback(Local<Object> receiver, Args... args, FastApiCallbackOptions& options) {
+    WASI* wasi = reinterpret_cast<WASI*>(BaseObject::FromJSObject(receiver));
+    if (wasi == nullptr) return UVWASI_EINVAL;
+
+    if (options.wasm_memory == nullptr) return UVWASI_EINVAL;
+    uint8_t* memory = nullptr;
+    CHECK(options.wasm_memory->getStorageIfAligned(&memory));
+
+    return F(*wasi, {(char*) memory, options.wasm_memory->length()}, args...);
+  }
+
+  template <typename VT>
+  static VT CheckType(Local<Value> v);
+
+  template <>
+  static uvwasi_errno_t CheckType(Local<Value> input) {
+    if (!input->IsUint32()) {
+      return UVWASI_EINVAL;
+    }
+    return UVWASI_ESUCCESS;
+  }
+
+  template <typename VT>
+  static VT Convert(Local<Value> V);
+
+  template <>
+  static uint32_t Convert(Local<Value> input) {
+    return input.As<Uint32>()->Value();
+  }
+
+  // template <std::size_t... Is>
+  static void SlowCallback(const FunctionCallbackInfo<Value>& args) {
+    WASI* wasi;
+    char* memory;
+    size_t mem_size;
+    RETURN_IF_BAD_ARG_COUNT(args, sizeof...(Args));
+
+    // CHECK_TO_TYPE_OR_RETURN(args, args[0], Uint32, argv_offset);
+    // CHECK_TO_TYPE_OR_RETURN(args, args[1], Uint32, argv_buf_offset);
+    /*
+    {
+      int counter = 0;
+      (({
+        auto result = CheckType<Args>(counter++);
+        if (result != UVWASI_ESUCCESS) {
+          args.GetReturnValue().Set(result);
+          return;
+        }
+      }), ...);
+    }
+    */
+
+    ASSIGN_INITIALIZED_OR_RETURN_UNWRAP(&wasi, args.This());
+    GET_BACKING_STORE_OR_RETURN(wasi, args, &memory, &mem_size);
+
+    int counter = 0;
+    args.GetReturnValue().Set(F(*wasi, {memory, mem_size}, Convert<Args>(args[counter++])...));
+  }
+};
+
+static uint32_t ArgsGet(WASI& wasi, WasmMemory memory, uint32_t argv_offset, uint32_t argv_buf_offset) {
+  Debug(&wasi, "args_get(%d, %d)\n", argv_offset, argv_buf_offset);
+
+  CHECK_BOUNDS_OR_RETURN2(memory.size,
+                          argv_buf_offset,
+                          wasi.uvw_.argv_buf_size);
+  CHECK_BOUNDS_OR_RETURN2(memory.size,
+                          argv_offset,
+                          wasi.uvw_.argc * UVWASI_SERDES_SIZE_uint32_t);
+  std::vector<char*> argv(wasi.uvw_.argc);
+  char* argv_buf = &memory.data[argv_buf_offset];
+  uvwasi_errno_t err = uvwasi_args_get(&wasi.uvw_, argv.data(), argv_buf);
 
   if (err == UVWASI_ESUCCESS) {
-    for (size_t i = 0; i < wasi->uvw_.argc; i++) {
+    for (size_t i = 0; i < wasi.uvw_.argc; i++) {
       uint32_t offset =
           static_cast<uint32_t>(argv_buf_offset + (argv[i] - argv[0]));
-      uvwasi_serdes_write_uint32_t(memory,
+      uvwasi_serdes_write_uint32_t(memory.data,
                                    argv_offset +
                                    (i * UVWASI_SERDES_SIZE_uint32_t),
                                    offset);
     }
   }
 
-  args.GetReturnValue().Set(err);
+  return err;
 }
-
 
 void WASI::ArgsSizesGet(const FunctionCallbackInfo<Value>& args) {
   WASI* wasi;
@@ -1673,7 +1756,8 @@ static void Initialize(Local<Object> target,
   tmpl->InstanceTemplate()->SetInternalFieldCount(WASI::kInternalFieldCount);
   tmpl->Inherit(BaseObject::GetConstructorTemplate(env));
 
-  env->SetProtoMethod(tmpl, "args_get", WASI::ArgsGet);
+  WasiFunction<ArgsGet, uint32_t, uint32_t, uint32_t>::SetFunction(env, "args_get", tmpl);
+
   env->SetProtoMethod(tmpl, "args_sizes_get", WASI::ArgsSizesGet);
   env->SetProtoMethod(tmpl, "clock_res_get", WASI::ClockResGet);
   env->SetProtoMethod(tmpl, "clock_time_get", WASI::ClockTimeGet);

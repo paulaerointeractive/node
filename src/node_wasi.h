@@ -23,7 +23,6 @@ class WASI : public BaseObject,
   SET_MEMORY_INFO_NAME(WASI)
   SET_SELF_SIZE(WASI)
 
-  static void ArgsGet(const v8::FunctionCallbackInfo<v8::Value>& args);
   static void ArgsSizesGet(const v8::FunctionCallbackInfo<v8::Value>& args);
   static void ClockResGet(const v8::FunctionCallbackInfo<v8::Value>& args);
   static void ClockTimeGet(const v8::FunctionCallbackInfo<v8::Value>& args);
@@ -82,6 +81,12 @@ class WASI : public BaseObject,
   void IncreaseAllocatedSize(size_t size);
   void DecreaseAllocatedSize(size_t size);
 
+  uvwasi_errno_t backingStore(char** store, size_t* byte_length);
+  uvwasi_t uvw_;
+  v8::Global<v8::WasmMemoryObject> memory_;
+  uvwasi_mem_t alloc_info_;
+  size_t current_uvwasi_memory_ = 0;
+
  private:
   ~WASI() override;
   inline void readUInt8(char* memory, uint8_t* value, uint32_t offset);
@@ -92,11 +97,6 @@ class WASI : public BaseObject,
   inline void writeUInt16(char* memory, uint16_t value, uint32_t offset);
   inline void writeUInt32(char* memory, uint32_t value, uint32_t offset);
   inline void writeUInt64(char* memory, uint64_t value, uint32_t offset);
-  uvwasi_errno_t backingStore(char** store, size_t* byte_length);
-  uvwasi_t uvw_;
-  v8::Global<v8::WasmMemoryObject> memory_;
-  uvwasi_mem_t alloc_info_;
-  size_t current_uvwasi_memory_ = 0;
 };
 
 
