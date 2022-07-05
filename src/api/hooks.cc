@@ -225,4 +225,4 @@ void EmitAsyncDestroy(Environment* env, async_context asyncContext) {
   AsyncWrap::EmitDestroy(env, asyncContext.async_id);
 }
 
-}  // namespace node
+}  // namespace node modules
